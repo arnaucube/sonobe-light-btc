@@ -15,6 +15,7 @@ use folding_schemes::{
     commitment::{kzg::KZG, pedersen::Pedersen},
     folding::nova::{decider_eth::Decider, Nova},
     frontend::FCircuit,
+    Error,
 };
 use folding_schemes::{folding::nova::decider_eth::prepare_calldata, Decider as DeciderTrait};
 use folding_schemes::{folding::nova::decider_eth_circuit::DeciderEthCircuit, FoldingScheme};
@@ -25,7 +26,7 @@ use solidity_verifiers::{
     get_decider_template_for_cyclefold_decider,
     utils::get_function_selector_for_nova_cyclefold_verifier,
 };
-use solidity_verifiers::{Groth16Data, KzgData, NovaCycleFoldData};
+use solidity_verifiers::{utils::get_formatted_calldata, NovaCycleFoldVerifierKey};
 use std::{fs, marker::PhantomData, time::Instant};
 use utils::setup;
 mod utils;
@@ -33,25 +34,34 @@ mod utils;
 #[derive(Clone, Debug)]
 pub struct BTCBlockCheckerFCircuit<F: PrimeField> {
     _f: PhantomData<F>,
-    block: Vec<Block>,
 }
 
 impl<F: PrimeField> FCircuit<F> for BTCBlockCheckerFCircuit<F> {
-    type Params = Vec<Block>;
+    type Params = ();
 
-    fn new(params: Self::Params) -> Self {
-        Self {
-            _f: PhantomData,
-            block: params,
-        }
+    fn new(params: Self::Params) -> Result<Self, Error> {
+        Ok(Self { _f: PhantomData })
     }
 
     fn state_len(&self) -> usize {
         1
     }
+    fn external_inputs_len(&self) -> usize {
+        1 // TODO set the number of the external_inputs
+    }
 
-    fn step_native(&self, i: usize, z_i: Vec<F>) -> Result<Vec<F>, folding_schemes::Error> {
+    fn step_native(
+        &self,
+        i: usize,
+        z_i: Vec<F>,
+        external_inputs: Vec<F>,
+    ) -> Result<Vec<F>, folding_schemes::Error> {
         let new_z_i = vec![z_i[0] + F::one()];
+
+        // TODO update internal logic to instead of using `self.block[i]` to use `external_inputs`
+        // ie.:
+        // let block_header = external_inputs[0];
+        // let block_hash = external_inputs[1];
 
         // Check block hash
         let computed_block_hash = get_block_hash(&self.block[i].block_header);
@@ -75,8 +85,11 @@ impl<F: PrimeField> FCircuit<F> for BTCBlockCheckerFCircuit<F> {
         &self,
         cs: ConstraintSystemRef<F>,
         i: usize,
-        z_i: Vec<ark_r1cs_std::fields::fp::FpVar<F>>,
-    ) -> Result<Vec<ark_r1cs_std::fields::fp::FpVar<F>>, SynthesisError> {
+        z_i: Vec<FpVar<F>>,
+        external_inputs: Vec<FpVar<F>>,
+    ) -> Result<Vec<FpVar<F>>, SynthesisError> {
+        // TODO update internal logic to instead of using `self.block[i]` to use `external_inputs`
+
         let new_z_i = vec![z_i[0].clone() + FpVar::new_constant(cs.clone(), F::one())?];
         let block_var = BlockVar::new_witness(cs.clone(), || Ok(self.block[i].clone()))?;
         let _ = BTCBlockCheckerGadget::check_block(cs.clone(), block_var.clone())?;
@@ -130,7 +143,7 @@ fn main() {
     >;
 
     let n_blocks_checked = blocks_prepared.len() / 20; // TMP rm '/20'
-    let circuit = BTCBlockCheckerFCircuit::<Fr>::new(blocks_prepared.clone());
+    let circuit = BTCBlockCheckerFCircuit::<Fr>::new(()).unwrap();
     let (fs_prover_params, kzg_vk) = setup(circuit.clone());
     let z_0 = vec![Fr::from(0)];
     let mut nova = NOVA::init(&fs_prover_params, circuit, z_0.clone()).unwrap();
@@ -142,6 +155,7 @@ fn main() {
         if i % 10 == 0 {
             println!("--- At block: {}/{} ---", current_state, n_blocks_checked);
         }
+        // TODO feed the external_inputs (from blocks_prepared) into prove_step
         nova.prove_step().unwrap();
     }
     println!(
@@ -189,12 +203,7 @@ fn main() {
     .unwrap();
     assert!(verified);
 
-    let g16_data = Groth16Data::from(g16_vk);
-    let kzg_data = KzgData::from((
-        kzg_vk,
-        fs_prover_params.cs_params.powers_of_g[0..3].to_vec(),
-    ));
-    let nova_cyclefold_data = NovaCycleFoldData::from((g16_data, kzg_data, nova.z_0.len()));
+    let nova_cyclefold_data = NovaCycleFoldVerifierKey::from((g16_vk, kzg_vk, nova.z_0.len()));
     let function_selector =
         get_function_selector_for_nova_cyclefold_verifier(nova.z_0.len() * 2 + 1);
 
@@ -215,6 +224,8 @@ fn main() {
     save_solidity("./NovaLightBTCClientDecider.sol", &decider_template.clone());
     // save calldata
     fs::write("./solidity-calldata.calldata", calldata.clone()).unwrap();
+    let s = get_formatted_calldata(calldata.clone());
+    fs::write("./solidity-calldata.inputs", s.join(",\n")).expect("");
 
     let nova_cyclefold_verifier_bytecode = compile_solidity(decider_template, "NovaDecider");
 
